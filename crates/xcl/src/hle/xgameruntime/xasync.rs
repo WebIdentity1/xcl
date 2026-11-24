@@ -111,6 +111,7 @@ impl Inner {
 
 pub struct State {
     id: u64,
+    block: usize,
     queue: Option<Arc<taskqueue::Queue>>,
     provider: usize,
     context: usize,
@@ -197,8 +198,10 @@ unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_
 }
 
 unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
-    let b = ctx as *mut XAsyncBlock;
-    let Lookup::Active(s) = lookup(b) else { return };
+    // Each accepted work item owns one strong reference from XAsyncSchedule.
+    let s = Arc::from_raw(ctx as *const State);
+    if s.inner.lock().unwrap().phase != Phase::Pending { return; }
+    let b = s.block as *mut XAsyncBlock;
     if canceled {
         XAsyncComplete(b, E_ABORT, 0);
         return;
@@ -242,6 +245,7 @@ pub unsafe extern "system" fn XAsyncBegin(
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        block: b as usize,
         queue: taskqueue::queue_from((*b).queue),
         provider,
         context: context as usize,
@@ -272,8 +276,11 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     let Some(q) = &s.queue else {
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
+    // The queued item owns this operation, even if the caller completes and reuses its block.
+    let ctx = Arc::into_raw(s.clone());
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
-    if !taskqueue::submit_delayed(q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
+    if !taskqueue::submit_delayed(q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: ctx as usize }) {
+        drop(Arc::from_raw(ctx));
         return E_ABORT;
     }
     S_OK
@@ -471,6 +478,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        block: b as usize,
         queue: taskqueue::queue_from((*b).queue),
         provider: 0,
         context: 0,
@@ -807,6 +815,99 @@ mod tests {
             assert!(dispatched);
             assert_eq!(status, 7);
             assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    unsafe extern "system" fn schedules_work(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+        if op == OP_BEGIN { XAsyncSchedule((*data).async_, 0) } else { S_OK }
+    }
+
+    #[test]
+    fn stale_queued_work_does_not_run_reused_block() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn second_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_DO_WORK {
+                (&*((*data).context as *const AtomicU32)).fetch_add(1, Ordering::SeqCst);
+            }
+            S_OK
+        }
+        for cancel in [false, true] {
+            unsafe {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+                let mut b: XAsyncBlock = std::mem::zeroed();
+                b.queue = q;
+                assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), schedules_work as usize), S_OK);
+                XAsyncComplete(&mut b, E_ABORT, 0);
+                let work = AtomicU32::new(0);
+                assert_eq!(XAsyncBegin(&mut b, &work as *const AtomicU32 as *mut c_void, std::ptr::null(), std::ptr::null(), second_provider as usize), S_OK);
+                let dispatched = if cancel {
+                    assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+                    true
+                } else {
+                    taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0)
+                };
+                let status = XAsyncGetStatus(&mut b, false);
+                XAsyncComplete(&mut b, E_ABORT, 0);
+                taskqueue::XTaskQueueCloseHandle(q);
+                assert!(dispatched);
+                assert_eq!(work.load(Ordering::SeqCst), 0, "old work must not invoke the new provider");
+                assert_eq!(status, E_PENDING, "the new operation did not schedule work (cancel={cancel})");
+            }
+        }
+    }
+
+
+    #[test]
+    fn stale_queued_work_does_not_read_completed_block() {
+        use windows_sys::Win32::System::{Diagnostics::Debug::{SetThreadErrorMode, SEM_NOGPFAULTERRORBOX}, Memory::*};
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut error_mode = 0;
+            assert_ne!(SetThreadErrorMode(SEM_NOGPFAULTERRORBOX, &mut error_mode), 0);
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!page.is_null());
+            let b = page as *mut XAsyncBlock;
+            std::ptr::write(b, XAsyncBlock { queue: q, context: std::ptr::null_mut(), callback: 0, internal: [0; 32] });
+            assert_eq!(XAsyncBegin(b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), schedules_work as usize), S_OK);
+            let Lookup::Active(state) = lookup(b) else { panic!("operation must be active") };
+            let weak = Arc::downgrade(&state);
+            drop(state);
+            XAsyncComplete(b, E_ABORT, 0);
+            let mut protection = 0;
+            assert_ne!(VirtualProtect(page, 4096, PAGE_NOACCESS, &mut protection), 0);
+            let dispatched = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let freed = VirtualFree(page, 0, MEM_RELEASE);
+            taskqueue::XTaskQueueCloseHandle(q);
+            SetThreadErrorMode(error_mode, std::ptr::null_mut());
+            assert!(dispatched);
+            assert_ne!(freed, 0);
+            assert!(weak.upgrade().is_none(), "discarding old work must release its state");
+        }
+    }
+
+    #[test]
+    fn queued_work_state_released_on_refusal() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            for delay in [0, 60_000] {
+                let mut b: XAsyncBlock = std::mem::zeroed();
+                b.queue = q;
+                assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+                let Lookup::Active(state) = lookup(&mut b) else { panic!("operation must be active") };
+                let weak = Arc::downgrade(&state);
+                drop(state);
+                let result = XAsyncSchedule(&mut b, delay);
+                XAsyncComplete(&mut b, E_ABORT, 0);
+                assert_eq!(result, E_ABORT);
+                assert!(weak.upgrade().is_none(), "rejected work must release its state");
+            }
+            taskqueue::XTaskQueueCloseHandle(q);
         }
     }
 
