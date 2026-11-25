@@ -866,6 +866,38 @@ mod used_tests {
     }
 
     #[test]
+    fn a_timed_out_waiter_does_not_cancel_an_unbounded_waiters_demand() {
+        let standin = 0x7E57_B522usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, false, Box::new(move || {
+            started.send(wanted_here()).unwrap();
+            let _ = finish.recv_timeout(Duration::from_secs(10));
+            0
+        }), 0);
+        let bind = std::thread::spawn(move || resolve_wait_with_budgets(standin, None, None, &FrameWaitBudget::new()));
+        let wanted = building.recv_timeout(Duration::from_secs(10)).expect("worker started");
+        let start = Instant::now();
+        while !wanted() && start.elapsed() < Duration::from_secs(5) { std::thread::yield_now(); }
+        let initial = wanted();
+        let timed = resolve_wait_with_budgets(standin, None, Some(Duration::from_millis(1)), &FrameWaitBudget::new());
+        let pending = entry(standin).unwrap();
+        let still_waiting = !bind.is_finished();
+        let wanted_after_timeout = wanted();
+        let waiters = pending.demand.lock().unwrap().waiters;
+        // Release the worker and join the waiter before asserting, including on the negative control.
+        let _ = go.send(());
+        let resolved = bind.join().unwrap();
+        let _ = released(standin);
+        println!("MIXED_WAIT initial={initial} unbounded_active={still_waiting} wanted_after_timeout={wanted_after_timeout} waiters={waiters}");
+        assert!(initial && still_waiting, "unbounded waiter must be active during the timeout");
+        assert_eq!((timed, resolved), (standin, standin));
+        assert!(wanted_after_timeout, "an unbounded waiter still needs the compile");
+        assert_eq!(waiters, 1);
+        assert_eq!(pending.demand.lock().unwrap().waiters, 0);
+    }
+
+    #[test]
     fn an_abandoned_wait_restores_worker_priority_before_its_next_job() {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
         let mut failures = Vec::new();
@@ -1204,7 +1236,7 @@ fn resolve_wait_with_budgets(
     } else {
         enqueue(&p, true);
     }
-    p.want();
+    let _want_guard = p.begin_wait();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
