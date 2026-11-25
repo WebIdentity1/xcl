@@ -210,6 +210,9 @@ fn workers() -> &'static Workers {
                         }
                     };
                     if p.orphan.load(Ordering::Acquire) {
+                        let mut done = p.done.lock().unwrap();
+                        *done = true;
+                        p.cv.notify_all();
                         continue;
                     }
                     let job = p.job.lock().unwrap().take();
@@ -462,6 +465,9 @@ fn preload() -> Option<&'static Preload> {
                     };
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
+                        let mut done = p.done.lock().unwrap();
+                        *done = true;
+                        p.cv.notify_all();
                         continue;
                     }
                     // (None: another worker already took it)
@@ -794,6 +800,35 @@ mod used_tests {
         assert_eq!((real_a, real_b), (0x6502, 0x6503));
         assert_eq!((queued_a, queued_b), (false, false), "switching bound PSOs must not queue unused lazy pipelines");
         assert_eq!((used_a, used_b), (false, false), "switching bound PSOs must not pollute the used-pipelines ledger");
+    }
+
+    #[test]
+    fn releasing_orphaned_pending_pso_unblocks_unbounded_waiter() {
+        let standin = 0x7E57_B510usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g_job = gate.clone();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let (m, cv) = &*g_job;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                0
+            }),
+            0,
+        );
+        let waiter = std::thread::spawn(move || resolve_wait_for(standin, None));
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(released(standin), 0);
+        // Waiter must unblock promptly even while the worker job is still gated.
+        let res = waiter.join().expect("waiter thread must not panic");
+        assert_eq!(res, standin);
+        // Release the worker job so the test leaves no blocked background thread behind.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
     }
 
     #[test]
@@ -1142,12 +1177,15 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
-    let done = p.done.lock().unwrap();
+    let mut done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
     } else {
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
+        // the worker stores its result into a Pending nobody will read: mark it orphaned and
+        // wake any unbounded waiter so releasing a pending PSO can never deadlock.
         p.orphan.store(true, Ordering::Release);
+        *done = true;
+        p.cv.notify_all();
         0
     }
 }
