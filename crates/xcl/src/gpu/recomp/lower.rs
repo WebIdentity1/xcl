@@ -186,6 +186,7 @@ struct Lower<'a, I: Ir> {
     noted: Option<Vec<String>>,
     /// a VS / PS (`lower_graphics`): `s_wqm` only of the launch EXEC (its quads' helper lanes)
     graphics: bool,
+    max_vgpr: u16,
 }
 
 /// A vector memory store: a side effect inactive lanes must not have.
@@ -1266,6 +1267,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         dpp_en: None,
         noted: survey.then(Vec::new),
         graphics,
+        max_vgpr: 0,
     };
     // the registers the program names, and the ones the runner reads back
     let mut sregs: Vec<u8> = vec![VCC, VCC + 1, 124, EXEC, EXEC + 1];
@@ -1281,6 +1283,11 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     sregs.dedup();
     vregs.sort_unstable();
     vregs.dedup();
+    l.max_vgpr = vregs.iter().copied().filter(|&v| v < 256).max().unwrap_or(0);
+    if insts.iter().any(|d| d.inst.name.starts_with("V_MOVREL") || d.inst.name == "V_SWAPREL_B32") {
+        // Relative addressing can touch gaps between explicitly named registers too.
+        vregs = (0..=l.max_vgpr).collect();
+    }
 
     // prologue: the SGPRs from `io` (kernel: the whole register file; compute: the user data)
     l.ir.at(0);
@@ -1676,7 +1683,13 @@ impl<I: Ir> Lower<'_, I> {
             inputs.push((Var::Scc, s));
         }
         // VGPRs read, and the ones written (a write keeps the old value where the guard is off)
-        let (vr, vw) = rdna2::vgpr_uses(d);
+        let (mut vr, mut vw) = rdna2::vgpr_uses(d);
+        if name.starts_with("V_MOVREL") || name == "V_SWAPREL_B32" {
+            // The foreign lowering indexes dynamically; transfer the whole possible
+            // register range in both directions, including inactive-lane values.
+            vr = (0..=self.max_vgpr as u64).collect();
+            vw = vr.clone();
+        }
         let mut vregs: Vec<u16> = vr.iter().chain(&vw).map(|&v| v as u16).collect();
         vregs.sort_unstable();
         vregs.dedup();

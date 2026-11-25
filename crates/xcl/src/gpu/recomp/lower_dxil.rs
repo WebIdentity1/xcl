@@ -436,6 +436,59 @@ mod tests {
         true
     }
 
+    #[test]
+    fn relative_registers_reach_compute_output() {
+        const WRITE: &[I] = &[("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 170)])];
+        const READ: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 170)]),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)]),
+        ];
+        const BOTH: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 170)]),
+            ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 1)]),
+        ];
+        const SEPARATE: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 170)]),
+            ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 1)]),
+        ];
+        const MASKED: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 135)]),
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 170)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)]),
+        ];
+        if !gpu() { return; }
+        println!("relative registers GPU: {}", runner::adapter().unwrap());
+        let mut modes = vec![(false, false), (true, true)];
+        if runner::wave64_supported() == Ok(true) { modes.push((true, false)); }
+        let cs = compute_cs();
+        let mut failures = Vec::new();
+        for (name, ops, result, m0) in [
+            ("write-before-use", WRITE, 3, 2), ("read", READ, 6, 2),
+            ("read-write", BOTH, 6, 2), ("separate-offsets", SEPARATE, 7, 0x30002),
+            ("inactive-lanes", MASKED, 3, 2),
+        ] {
+            let mut code = encode_line(&("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 0)]));
+            code.extend(ops.iter().flat_map(encode_line));
+            code.extend(encode_line(&("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 130), ("VSRC1", 0)])));
+            code.extend(encode_line(&("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)])));
+            code.extend(crate::gpu::rdna2::encode("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", result), ("SADDR", 125), ("OFFSET", 0)], None).unwrap());
+            code.extend(encode_line(&ENDPGM));
+            for &(wave64, split) in &modes {
+                let opts = crate::gpu::dxil::kernel::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+                let direct = crate::gpu::dxil::kernel::translate_compute(&code, opts, &cs).unwrap().dxil;
+                let per_lane = super::compute_with(&code, &cs, opts).unwrap().dxil;
+                for (backend, dxil) in [("direct", direct), ("per-lane", per_lane)] {
+                    let got = runner::dispatch(&dxil, [1, 1, 1], &[m0, 0], &vec![0u32; 64]).unwrap();
+                    let bad = got[..64].iter().enumerate().filter(|&(lane, &v)| v != if name == "inactive-lanes" && lane >= 16 { 7 } else { 42 }).count();
+                    println!("{name}, {backend}, wave64={wave64}, split={split}: {bad}/64 mismatches");
+                    if bad != 0 { failures.push((name, backend, wave64, split)); }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "relative register mismatches: {failures:?}");
+    }
+
     /// A rounding mode #1426's lowering cannot honour refuses the program, as #1426 and the HLSL
     /// path do, instead of the per-lane form computing with the default mode (Kalmarv, #1745):
     /// f32 toward zero by `s_setreg`, f64 by `s_round_mode` and by `s_setreg`.

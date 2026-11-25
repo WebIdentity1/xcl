@@ -169,6 +169,8 @@ pub struct Lw {
     pub s: Shader,
     pub ssa: Ssa,
     pub init: Init,
+    /// Highest register named anywhere in this program, independent of lowering order.
+    pub max_vgpr: u64,
     pub wave64: bool,
     /// wave64 program in two hardware wave32 halves
     pub split: bool,
