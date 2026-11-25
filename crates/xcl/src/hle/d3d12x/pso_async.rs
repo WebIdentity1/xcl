@@ -84,9 +84,8 @@ fn build(p: &Arc<Pending>, job: Job, base_priority: i32) {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
         d.worker_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
-        }
+        // A timed-out waiter can clear wanted after this worker was boosted.
+        unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
@@ -864,6 +863,55 @@ mod used_tests {
         // Release the worker job so the test leaves no blocked background thread behind.
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
+    }
+
+    #[test]
+    fn an_abandoned_wait_restores_worker_priority_before_its_next_job() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+        let mut failures = Vec::new();
+        for (i, base) in [THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST].into_iter().enumerate() {
+            let standin = 0x7E57_B530usize + 2 * i;
+            let (started, building) = mpsc::channel();
+            let (go, finish) = mpsc::channel::<()>();
+            submit_lazy(standin, false, Box::new(move || {
+                started.send(unsafe { GetThreadPriority(GetCurrentThread()) }).unwrap();
+                let _ = finish.recv_timeout(Duration::from_secs(10));
+                0
+            }), 0);
+            submit_lazy(standin + 1, false, Box::new(|| 0), 0);
+            let p = entry(standin).unwrap();
+            let q = entry(standin + 1).unwrap();
+            let job = p.job.lock().unwrap().take().unwrap();
+            let _ = q.job.lock().unwrap().take();
+            let guard = p.begin_wait();
+            let worker_p = p.clone();
+            // Dedicated test-owned thread, using the production build lifecycle twice.
+            let worker = std::thread::spawn(move || unsafe {
+                assert_ne!(SetThreadPriority(GetCurrentThread(), base), 0);
+                let initial = GetThreadPriority(GetCurrentThread());
+                build(&worker_p, job, base);
+                let after = GetThreadPriority(GetCurrentThread());
+                let (tx, rx) = mpsc::channel();
+                build(&q, Box::new(move || {
+                    tx.send(GetThreadPriority(GetCurrentThread())).unwrap();
+                    0
+                }), base);
+                (initial, after, rx.recv().unwrap())
+            });
+            let during = building.recv_timeout(Duration::from_secs(10)).expect("boosted build started");
+            guard.abandon();
+            let abandoned = !p.demand.lock().unwrap().wanted;
+            let _ = go.send(());
+            let (initial, after, next) = worker.join().unwrap();
+            let _ = released(standin);
+            let _ = released(standin + 1);
+            println!("WORKER_PRIORITY base={base} initial={initial} during={during} abandoned={abandoned} after={after} next={next}");
+            assert_eq!(initial, base);
+            assert_eq!(during, THREAD_PRIORITY_NORMAL);
+            assert!(abandoned);
+            if after != base || next != base { failures.push(base); }
+        }
+        assert!(failures.is_empty(), "workers kept boosted priority after abandonment: {failures:?}");
     }
 
     #[test]
